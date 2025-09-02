@@ -1,55 +1,65 @@
-import requests
-import time
+from __future__ import annotations
+
 import os
+import time
+from typing import Dict, List
+
 from dotenv import load_dotenv
 
+from ..core.explorer_client import ExplorerClient  # Etherscan Multichain v2
+
 load_dotenv()
-BASESCAN_API = "https://api.basescan.org/api"
+
 USDC_CONTRACT = "0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913"  # USDC on Base
-API_KEY = os.getenv("BASESCAN_API_KEY")
 
 
 def get_transfers(
     address: str,
     contract_address: str = USDC_CONTRACT,
-    apikey: str = API_KEY,
+    *,
     start_block: int = 0,
-    end_block: int = 99999999,
+    end_block: int = 99_999_999,
     sort: str = "asc",
     max_pages: int = 10,
     sleep_sec: float = 0.2,
-):
+    page_size: int = 100,
+    explorer: ExplorerClient | None = None,
+) -> List[Dict]:
     """
-    Returns a list of token transfers involving `address` for the given ERC-20 `contract_address` (e.g. USDC).
-    Each transfer includes: timestamp, blockNumber, from, to, value, txHash
+    Return token transfers involving `address` for the given ERC-20 `contract_address` (e.g., USDC).
+    Each transfer includes: timestamp, blockNumber, from, to, value, txHash.
+    Filters to the standard transfer function signature.
     """
-    results = []
+    if explorer is None:
+        explorer = ExplorerClient()
+
+    results: List[Dict] = []
     page = 1
-    offset = 100  # max per page
 
     while page <= max_pages:
-        params = {
-            "module": "account",
-            "action": "tokentx",
-            "address": address,
-            "contractaddress": contract_address,
-            "startblock": start_block,
-            "endblock": end_block,
-            "page": page,
-            "offset": offset,
-            "sort": sort,
-            "apikey": apikey,
-        }
+        resp = explorer.tokentx(
+            address=address,
+            contractaddress=contract_address,
+            startblock=start_block,
+            endblock=end_block,
+            page=page,
+            offset=page_size,
+            sort=sort,
+        )
 
-        resp = requests.get(BASESCAN_API, params=params)
-        data = resp.json()
-
-        if data["status"] != "1" or "result" not in data:
-            print(f"Stopped at page {page}: {data.get('message', 'Unknown error')}")
+        if (
+            not isinstance(resp, dict)
+            or resp.get("status") != "1"
+            or "result" not in resp
+        ):
+            # v2 still uses {status,message,result}; break on no data / error
             break
 
-        for tx in data["result"]:
-            if tx["functionName"] != "transfer(address recipient,uint256 amount)":
+        rows = resp["result"] or []
+
+        for tx in rows:
+            # Keep your original safeguard: only plain ERC20 transfer events
+            if tx.get("functionName") != "transfer(address recipient,uint256 amount)":
                 continue
             results.append(
                 {
@@ -62,11 +72,12 @@ def get_transfers(
                 }
             )
 
-        if len(data["result"]) < offset:
+        if len(rows) < page_size:
             break
 
         page += 1
-        time.sleep(sleep_sec)
+        if sleep_sec:
+            time.sleep(sleep_sec)
 
     return results
 
@@ -78,5 +89,6 @@ if __name__ == "__main__":
     txs = get_transfers(test_address)
     df = pd.DataFrame(txs)
     df["timestamp"] = pd.to_datetime(df["timestamp"], unit="s")
-    df["value"] /= 1e6
+    # USDC has 6 decimals
+    df["value"] = df["value"] / 1_000_000
     print(df.head())

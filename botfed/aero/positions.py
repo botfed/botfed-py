@@ -26,12 +26,26 @@ def get_position(w3, position_id: int, block: int):
     return pos
 
 
+def _encode_call(contract, fn_name: str, *args):
+    """
+    Compatibility layer for encoding contract calls across web3.py versions.
+    """
+    # web3.py v6
+    if hasattr(contract, "encode_abi"):
+        return contract.encode_abi(fn_name, args=list(args))
+    # web3.py v5
+    if hasattr(contract, "encodeABI"):
+        return contract.encodeABI(fn_name=fn_name, args=list(args))
+    # Fallback (works on both, but a bit “private” in v6)
+    return contract.get_function_by_name(fn_name)(*args)._encode_transaction_data()
+
+
 def get_positions_batch(w3, position_ids, block):
     multicall = w3.eth.contract(address=MULTICALL3_ADDR, abi=MULTICALL3_ABI)
     pos_manager = w3.eth.contract(abi=POS_MANAGER_ABI, address=POS_MANAGER_ADDR)
 
     calls = [
-        (POS_MANAGER_ADDR, pos_manager.encodeABI(fn_name="positions", args=[pid]))
+        (POS_MANAGER_ADDR, _encode_call(pos_manager, "positions", pid))
         for pid in position_ids
     ]
 
@@ -76,29 +90,37 @@ def get_pool(w3, token0, token1, tick_spacing):
 def get_pools_batch(w3, pool_list, block=None):
     """
     Batch fetch pool addresses for multiple (token0, token1, tick_spacing) tuples.
+    Uses Multicall3.tryAggregate for consistent return shape.
     """
-
     multicall = w3.eth.contract(address=MULTICALL3_ADDR, abi=MULTICALL3_ABI)
     factory = w3.eth.contract(address=POOL_FACTORY_ADDR, abi=POOL_FACTORY_ABI)
 
     calls = []
     for token0, token1, tick_spacing in pool_list:
-        call_data = factory.encodeABI(
-            fn_name="getPool",
-            args=[
-                w3.to_checksum_address(token0),
-                w3.to_checksum_address(token1),
-                tick_spacing,
-            ],
+        call_data = _encode_call(
+            factory,
+            "getPool",
+            w3.to_checksum_address(token0),
+            w3.to_checksum_address(token1),
+            tick_spacing,
         )
+        # Multicall3 expects (address target, bytes callData)
         calls.append((POOL_FACTORY_ADDR, call_data))
 
-    _, return_data = multicall.functions.aggregate(calls).call(block_identifier=block)
+    # tryAggregate returns [(success, returnData), ...]
+    results = multicall.functions.tryAggregate(False, calls).call(
+        block_identifier=block
+    )
 
-    pools = [
-        w3.to_checksum_address(w3.codec.decode(["address"], raw)[0])
-        for raw in return_data
-    ]
+    pools = []
+    for success, raw in results:
+        if not success:
+            pools.append(
+                Web3.to_checksum_address("0x0000000000000000000000000000000000000000")
+            )
+            continue
+        addr = w3.codec.decode(["address"], raw)[0]
+        pools.append(w3.to_checksum_address(addr))
     return pools
 
 
@@ -123,9 +145,7 @@ def get_rewards(
         calls.append(
             (
                 w3.to_checksum_address(pool_infos[pool_id].gauge),
-                gauges[pool_id].encodeABI(
-                    fn_name="earned", args=[position_owners[idx], pos_id]
-                ),
+                _encode_call(gauges[pool_id], "earned", position_owners[idx], pos_id),
             )
         )
 
@@ -222,9 +242,11 @@ def get_exposures(
     exps = []
     positions = get_positions_batch(w3, position_ids, block)
     positions = [pos for pos in positions if pos[1] is not None]
+
     exps, pool_infos, token_infos, positions, pool_addresses = compute_exposures(
         w3, positions, block, extra_tokens=extra_tokens, pool_tokens=pool_tokens
     )
+
     return (
         pd.DataFrame(exps).fillna(0).set_index("position_id"),
         pool_infos,
@@ -249,27 +271,25 @@ def get_wallet_exp(w3, eoa, tokens, block):
 def get_balances(w3: Web3, eoa: str, tokens: Mapping[str, Token], block: int):
     multicall = w3.eth.contract(address=MULTICALL3_ADDR, abi=MULTICALL3_ABI)
 
-    # Encode balanceOf(eoa) for each token
     calls = []
     for token in tokens.values():
         contract = w3.eth.contract(address=token.address, abi=ERC20_ABI)
-        call_data = contract.encodeABI(fn_name="balanceOf", args=[eoa])
+        call_data = _encode_call(contract, "balanceOf", eoa)
         calls.append((token.address, call_data))
 
-    # Format for multicall: list of tuples -> list of dicts
-    call_structs = [{"target": addr, "callData": data} for addr, data in calls]
-
-    # Call Multicall3.aggregate
-    _, return_data = multicall.functions.aggregate(call_structs).call(
+    # Consistent with other calls: tryAggregate returns [(success, returnData)]
+    results = multicall.functions.tryAggregate(False, calls).call(
         block_identifier=block
     )
 
-    # Decode each return value as uint256 and divide by decimals
     balances = {}
-    for token, raw in zip(tokens.values(), return_data):
-        balance = int.from_bytes(raw[-32:], byteorder="big")
-        balances[token.address] = balance
-
+    for token, (success, raw) in zip(tokens.values(), results):
+        if not success or not raw:
+            balances[token.address] = 0
+            continue
+        # balanceOf returns uint256
+        val = w3.codec.decode(["uint256"], raw)[0]
+        balances[token.address] = val
 
     return balances
 
@@ -321,7 +341,9 @@ def get_exp_with_rewards(
         balances = None
     position_ids = [p[0] for p in positions]
     position_owners = [eoa for p in positions]
-    rewards = get_rewards(w3, block, pool_infos, position_ids, position_owners, pool_addresses)
+    rewards = get_rewards(
+        w3, block, pool_infos, position_ids, position_owners, pool_addresses
+    )
     rewards = pd.DataFrame(rewards).set_index("position_id")
     if "AERO" not in df.columns:
         df["AERO"] = 0

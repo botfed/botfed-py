@@ -4,7 +4,9 @@ from ..etherscan.get_transfers import get_transfers
 
 
 def get_funding_transfers(funding_addr: str, manager_addr: str, withdraw_addr: str):
-    txs = get_transfers(funding_addr)
+    txs = get_transfers(
+        funding_addr
+    )  # TODO: get transfers should raise when not fetching / guard against invalid API key
     df = pd.DataFrame(txs)
     df["from"] = df["from"].apply(lambda x: x.lower())
     df["to"] = df["to"].apply(lambda x: x.lower())

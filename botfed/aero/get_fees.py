@@ -5,6 +5,7 @@ from .vars import get_w3, POS_MANAGER_ADDR, MULTICALL3_ADDR
 from .helpers import fetch_info_from_pool_id, CLMMSnap
 from .abis.pool_clmm import ABI as POOL_ABI
 from .positions import get_pools_batch, get_positions_batch
+from .positions import _encode_call
 
 UINT_128_MAX = 2**128 - 1
 
@@ -71,7 +72,7 @@ def get_claimable_fees(
         calls.append(
             (
                 w3.to_checksum_address(pool_infos[pool_id].gauge),
-                pool_contracts[pool_id].encodeABI(fn_name="positions", args=[pos_key]),
+                _encode_call(pool_contracts[pool_id], "positions", pos_key),
             )
         )
     _, return_data = multicall.functions.aggregate(calls).call(block_identifier=block)

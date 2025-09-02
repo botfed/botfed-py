@@ -1,81 +1,71 @@
-import os
+from __future__ import annotations
+
 import json
-import requests
+import os
 import time
-from web3 import Web3
+from pathlib import Path
+from typing import Any, Dict, List, Tuple
+
+import requests
 from dotenv import load_dotenv
+from web3 import Web3
 
 from ..logger import get_logger
+from ..core.explorer_client import ExplorerClient  # <-- v2 wrapper
 
 logger = get_logger(__name__)
 
-
-TOKEN_BLACKLIST = [
-    Web3.to_checksum_address("0x2FD15e8E29578beDE34E6FC8Ba1d7a83D12F0eea")  # KITTY
-]
-
-# --- Config ---
-CACHE_FILE = "../data/token_safety_cache.json"
-BASESCAN_API = "https://api.basescan.org/api"
-
-# --- Load .env ---
+# --- Setup / env ---
 load_dotenv()
-API_KEY = os.getenv("BASESCAN_API_KEY")
+
 EOA = os.getenv("LP_ADDR")
 if not EOA:
     raise ValueError("Missing LP_ADDR in .env")
 
-# --- Load persistent cache ---
-if os.path.exists(CACHE_FILE):
-    with open(CACHE_FILE, "r") as f:
-        token_cache = json.load(f)
+# Thin Etherscan v2 client (injects chainid+apikey, handles NOTOK/retries)
+explorer = ExplorerClient()
+
+# --- Token hard filters ---
+TOKEN_BLACKLIST = {
+    Web3.to_checksum_address("0x2FD15e8E29578beDE34E6FC8Ba1d7a83D12F0eea")  # KITTY
+}
+
+# --- Caching paths (project-relative) ---
+ROOT = Path(__file__).resolve().parents[3]  # repo root (…/botfed)
+DATA_DIR = ROOT / "data"
+DATA_DIR.mkdir(parents=True, exist_ok=True)
+CACHE_FILE = DATA_DIR / "token_safety_cache.json"
+
+DATASETS_DIR = ROOT / "datasets"
+DATASETS_DIR.mkdir(parents=True, exist_ok=True)
+
+# --- Persistent cache for token safety lookups ---
+if CACHE_FILE.exists():
+    token_cache: Dict[str, Dict[str, Any]] = json.loads(CACHE_FILE.read_text())
 else:
     token_cache = {}
 
 
-def save_cache():
-    with open(CACHE_FILE, "w") as f:
-        json.dump(token_cache, f, indent=2)
+def _save_cache() -> None:
+    CACHE_FILE.write_text(json.dumps(token_cache, indent=2))
 
 
-# --- Analyze Token (uses cache) ---
-def analyze_token(token_address):
-    token_address = token_address.lower()
-    if token_address in token_cache:
-        return token_cache[token_address]
-
-    result = {"is_listed": False}
-
-    # Step 1: Dexscreener
-    is_listed, pair_info = check_dexscreener(token_address)
-    result["is_listed"] = is_listed
-
-    # Step 2: Honeypot
-    if is_listed and pair_info:
-        hp = check_honeypot(
-            token_address, pair_info["pair_address"], pair_info["chain_id"]
-        )
-        if hp:
-            result.update(hp)
-
-    token_cache[token_address] = result
-    save_cache()
-    return result
-
-
-# --- Dexscreener API ---
-def check_dexscreener(token_address):
+# ---------- External intel ----------
+def check_dexscreener(token_address: str) -> Tuple[bool, Dict[str, str] | None]:
+    """Return (is_listed, {'pair_address','chain_id'}) using Dexscreener."""
     url = f"https://api.dexscreener.com/latest/dex/tokens/{token_address}"
     try:
         r = requests.get(url, timeout=5)
-        if r.status_code != 200:
-            return False, None
+        r.raise_for_status()
         data = r.json()
-        pairs = data.get("pairs", [])
+        pairs = data.get("pairs", []) or []
         if not pairs:
             return False, None
-        uniswap = [p for p in pairs if p["dexId"] == "uniswap"]
+
+        # Prefer Uniswap on Base if present; otherwise first result.
+        uniswap = [p for p in pairs if p.get("dexId") == "uniswap"]
         first = uniswap[0] if uniswap else pairs[0]
+
         return True, {
             "pair_address": first["pairAddress"],
             "chain_id": str(first["chainId"]),
@@ -85,9 +75,12 @@ def check_dexscreener(token_address):
         return False, None
 
 
-# --- Honeypot.is API ---
-def check_honeypot(token, pair, chain_id):
-    url = f"https://api.honeypot.is/v2/IsHoneypot?address={token}&pair={pair}&chainID={chain_id}"
+def check_honeypot(token: str, pair: str, chain_id: str) -> Dict[str, Any] | None:
+    """Honeypot.is v2 simulation report."""
+    url = (
+        "https://api.honeypot.is/v2/IsHoneypot"
+        f"?address={token}&pair={pair}&chainID={chain_id}"
+    )
     try:
         r = requests.get(url, timeout=5)
         if r.status_code != 200:
@@ -105,116 +98,125 @@ def check_honeypot(token, pair, chain_id):
         return None
 
 
-# --- Basescan Token Transfers ---
+# ---------- Etherscan v2 (through ExplorerClient) ----------
 def fetch_token_transfers(
-    address, page=1, offset=100, startblock=0, endblock=99999999, sort="desc"
-):
-    params = {
-        "module": "account",
-        "action": "tokentx",
-        "address": address,
-        "page": page,
-        "offset": offset,
-        "startblock": startblock,
-        "endblock": endblock,
-        "sort": sort,
-        "apikey": API_KEY,
-    }
-    r = requests.get(BASESCAN_API, params=params)
-    data = r.json()
-    if data["status"] != "1":
-        logger.error(f"Error: {data.get('message')}")
-        return []
-    return data["result"]
-
-
-def classify_transfers(transfers, eoa):
-    incoming, outgoing = [], []
-    eoa = eoa.lower()
-    for tx in transfers:
-        if tx["to"].lower() == eoa:
-            incoming.append(tx)
-        elif tx["from"].lower() == eoa:
-            outgoing.append(tx)
-    return incoming, outgoing
-
-
-def get_unique_tokens(transfers):
-    seen = {}
-    for tx in transfers:
-        c = tx["contractAddress"]
-        if c not in seen:
-            seen[c] = tx
-    return seen
-
-
-def fetch_token_transfers(
-    address, offset=100, startblock=0, endblock=99999999, sort="desc", max_pages=10
-):
-    all_results = []
-
+    address: str,
+    *,
+    startblock: int = 0,
+    endblock: int = 999_999_999,
+    sort: str = "desc",
+    page_size: int = 100,
+    max_pages: int = 100,
+    inter_page_sleep_s: float = 1.0,
+) -> List[Dict[str, Any]]:
+    """Paginate /account/tokentx via Etherscan v2. Stops when a page < page_size."""
+    all_results: List[Dict[str, Any]] = []
     for page in range(1, max_pages + 1):
-        params = {
-            "module": "account",
-            "action": "tokentx",
-            "address": address,
-            "page": page,
-            "offset": offset,
-            "startblock": startblock,
-            "endblock": endblock,
-            "sort": sort,
-            "apikey": API_KEY,
-        }
-        response = requests.get(BASESCAN_API, params=params)
-        data = response.json()
+        resp = explorer.tokentx(
+            address=address,
+            page=page,
+            offset=page_size,
+            sort=sort,
+            startblock=startblock,
+            endblock=endblock,
+        )
 
-        if data.get("status") != "1" or "result" not in data:
-            logger.debug(
-                f"Stopped at page {page}: {data.get('message', 'Unknown error')}"
-            )
+        # Etherscan v2 still returns {status,message,result}
+        if not isinstance(resp, dict) or resp.get("status") != "1":
+            msg = (resp or {}).get("message", "unknown")
+            logger.debug(f"Stopped at page {page}: {msg}")
             break
 
-        all_results.extend(data["result"])
+        chunk = resp.get("result") or []
+        all_results.extend(chunk)
 
-        if len(data["result"]) < offset:
+        if len(chunk) < page_size:
             break
-
-        if page < max_pages:
-            time.sleep(1)
+        if page < max_pages and inter_page_sleep_s:
+            time.sleep(inter_page_sleep_s)
 
     return all_results
 
 
-def get_safe_tokens(eoa: str, startblock: int = 0, endblock: int = 999999999):
-    os.makedirs("./datasets", exist_ok=True)
-    cache_path = f"./datasets/token_transfers_{eoa}.json"
+# ---------- Helpers ----------
+def classify_transfers(transfers: List[Dict[str, Any]], eoa: str):
+    incoming, outgoing = [], []
+    eoa_l = eoa.lower()
+    for tx in transfers:
+        if tx.get("to", "").lower() == eoa_l:
+            incoming.append(tx)
+        elif tx.get("from", "").lower() == eoa_l:
+            outgoing.append(tx)
+    return incoming, outgoing
 
-    # Load from cache if available
-    if os.path.exists(cache_path):
-        with open(cache_path) as f:
-            cached = json.load(f)
+
+def get_unique_tokens(transfers: List[Dict[str, Any]]) -> Dict[str, Dict[str, Any]]:
+    """Map contractAddress -> first seen transfer row."""
+    seen: Dict[str, Dict[str, Any]] = {}
+    for tx in transfers:
+        c = tx.get("contractAddress")
+        if c and c not in seen:
+            seen[c] = tx
+    return seen
+
+
+# ---------- Safety analysis (with cache) ----------
+def analyze_token(token_address: str) -> Dict[str, Any]:
+    """Check listing + honeypot risk, caching by lowercase address."""
+    token_address_l = token_address.lower()
+    if token_address_l in token_cache:
+        return token_cache[token_address_l]
+
+    result: Dict[str, Any] = {"is_listed": False}
+
+    # 1) Listing intel (Dexscreener)
+    is_listed, pair_info = check_dexscreener(token_address)
+    result["is_listed"] = is_listed
+
+    # 2) Honeypot simulation when listed
+    if is_listed and pair_info:
+        hp = check_honeypot(
+            token_address, pair_info["pair_address"], pair_info["chain_id"]
+        )
+        if hp:
+            result.update(hp)
+
+    token_cache[token_address_l] = result
+    _save_cache()
+    return result
+
+
+def get_safe_tokens(eoa: str, *, startblock: int = 0, endblock: int = 999_999_999):
+    """Return {token_address -> sample_tx} for tokens that look tradable (not honeypots)."""
+    cache_path = DATASETS_DIR / f"token_transfers_{eoa}.json"
+
+    # Use existing on-disk history to cap new pagination
+    if cache_path.exists():
+        cached = json.loads(cache_path.read_text())
         max_pages = 1
     else:
         cached = []
         max_pages = 100
 
-    # Fetch new transfers
-    transfers = fetch_token_transfers(
-        eoa, max_pages=max_pages, startblock=startblock, endblock=endblock
+    new_transfers = fetch_token_transfers(
+        eoa, startblock=startblock, endblock=endblock, max_pages=max_pages
     )
 
-    # Combine and deduplicate
-    all_transfers = cached + transfers
-    seen = {}
+    # Combine and dedupe by contractAddress
+    all_transfers = cached + new_transfers
+    by_contract: Dict[str, Dict[str, Any]] = {}
     for tx in all_transfers:
-        c = Web3.to_checksum_address(tx["contractAddress"])
-        if c not in seen:
-            seen[c] = tx
+        c_raw = tx.get("contractAddress")
+        if not c_raw:
+            continue
+        c = Web3.to_checksum_address(c_raw)
+        if c not in by_contract:
+            by_contract[c] = tx
 
-    safe = {}
+    safe: Dict[str, Dict[str, Any]] = {}
     updated = False
-    for addr, tx in seen.items():
-        if addr in safe or Web3.to_checksum_address(addr) in TOKEN_BLACKLIST:
+    for addr, tx in by_contract.items():
+        if addr in TOKEN_BLACKLIST:
             continue
         result = analyze_token(addr)
         if result.get("is_listed") and not result.get("is_honeypot", False):
@@ -222,30 +224,36 @@ def get_safe_tokens(eoa: str, startblock: int = 0, endblock: int = 999999999):
             updated = True
 
     if updated:
-        with open(cache_path, "w") as f:
-            json.dump(list(seen.values()), f, indent=2)
+        cache_path.write_text(json.dumps(list(by_contract.values()), indent=2))
 
     return safe
 
 
-# --- Main ---
+# ---------- CLI quick check ----------
 if __name__ == "__main__":
     print(f"\n📦 Fetching token transfers for {EOA}...\n")
     txs = fetch_token_transfers(EOA)
     incoming, outgoing = classify_transfers(txs, EOA)
 
+    print(f"Incoming: {len(incoming)} | Outgoing: {len(outgoing)}")
+
     print("\n🔍 Checking tokens for listing + honeypot risk...\n")
     token_map = get_unique_tokens(txs)
     for addr, tx in token_map.items():
         result = analyze_token(addr)
-        if result["is_listed"]:
-            print(f"{addr} | {tx['tokenSymbol']}")
-            print(f"  Honeypot: {'✅ YES' if result.get('is_honeypot') else '❌ NO'}")
-            print(f"  Reason: {result.get('risk_reason', '')}")
+        if result.get("is_listed"):
+            print(f"{addr} | {tx.get('tokenSymbol', '?')}")
+            hp = result.get("is_honeypot")
+            print(f"  Honeypot: {'✅ YES' if hp else '❌ NO'}")
+            if result.get("risk_reason"):
+                print(f"  Reason: {result['risk_reason']}")
             print(
-                f"  Buy Tax: {result.get('buy_tax')}%, Sell Tax: {result.get('sell_tax')}%\n"
+                f"  Buy Tax: {result.get('buy_tax', 0)}%, "
+                f"Sell Tax: {result.get('sell_tax', 0)}%, "
+                f"Transfer Tax: {result.get('transfer_tax', 0)}%\n"
             )
 
+    print("\n✅ Safe tokens (listed, not honeypot):")
     safe = get_safe_tokens(EOA)
-    for tx, v in safe.items():
-        print(tx, v["tokenSymbol"])
+    for taddr, tx in safe.items():
+        print(taddr, tx.get("tokenSymbol", "?"))
