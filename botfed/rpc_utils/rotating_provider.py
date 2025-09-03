@@ -65,6 +65,7 @@ class RotatingHTTPProvider(HTTPProvider):
                     return response
                 except Exception as e:
                     wait_time = self._apply_backoff(url)
+                    logger.error(e)
                     logger.debug(f"[RPC FAIL] {url} -> {e}. Backing off for {wait_time}s")
             count += 1
         raise Exception("All RPC endpoints failed or are in backoff")
