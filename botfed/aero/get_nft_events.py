@@ -53,7 +53,6 @@ def get_aerodrome_nft_transfers(
         argument_filters={"to": Web3.to_checksum_address(to_address)},
     )
 
-
     # Get all matching events
     events = event_filter.get_all_entries()
 
@@ -72,7 +71,6 @@ def get_aerodrome_nft_transfers(
         transfers.append(transfer)
 
     return transfers
-
 
 
 def get_aerodrome_nft_transfers_batch(
