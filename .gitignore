@@ -178,3 +178,4 @@ tardis_data/
 markout*txt
 gmx.yaml
 *.png
+.s3cfg
