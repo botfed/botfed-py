@@ -74,6 +74,7 @@ def get_aerodrome_nft_transfers(
     return transfers
 
 
+
 def get_aerodrome_nft_transfers_batch(
     web3: Web3,
     contract_address: str,
